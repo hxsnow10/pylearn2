@@ -1,3 +1,4 @@
+#encoding=utf-8
 """
 Multilayer Perceptron
 """
@@ -12,6 +13,7 @@ import math
 import operator
 import sys
 import warnings
+import os
 
 import numpy as np
 from theano.compat import six
@@ -45,6 +47,7 @@ from pylearn2.space import CompositeSpace
 from pylearn2.space import Conv2DSpace
 from pylearn2.space import Space
 from pylearn2.space import VectorSpace, IndexSpace
+from pylearn2.space import SequenceSpace
 from pylearn2.utils import function
 from pylearn2.utils import is_iterable
 from pylearn2.utils import py_float_types
@@ -831,18 +834,19 @@ class MLP(Layer):
                 scale = input_scales[layer_name]
             else:
                 scale = default_input_scale
-
-            state_below = self.apply_dropout(
-                state=state_below,
-                include_prob=include_prob,
-                theano_rng=theano_rng,
-                scale=scale,
-                mask_value=layer.dropout_input_mask_value,
-                input_space=layer.get_input_space(),
-                per_example=per_example
-            )
+            if not isinstance(layer, DenseProjection):
+                print layer
+                state_below = self.apply_dropout(
+                    state=state_below,
+                    include_prob=include_prob,
+                    theano_rng=theano_rng,
+                    scale=scale,
+                    mask_value=layer.dropout_input_mask_value,
+                    input_space=layer.get_input_space(),
+                    per_example=per_example
+                )
             state_below = layer.fprop(state_below)
-
+        #theano.printing.debugprint(state_below)
         return state_below
 
     def masked_fprop(self, state_below, mask, masked_input_layers=None,
@@ -988,6 +992,7 @@ class MLP(Layer):
 
         if return_all:
             return rlist
+        #theano.printing.debugprint(rval)
         return rval
 
     def apply_dropout(self, state, include_prob, scale, theano_rng,
@@ -1052,6 +1057,34 @@ class MLP(Layer):
 
         return self.layers[-1].cost_from_cost_matrix(cost_matrix)
 
+    def dropout_cost_from_X(self, data):
+        """
+        Computes self.cost, but takes data=(X, Y) rather than Y_hat as an
+        argument.
+
+        This is just a wrapper around self.cost that computes Y_hat by
+        calling Y_hat = self.fprop(X)
+
+        Parameters
+        ----------
+        data : WRITEME
+        """
+        self.dropout_cost_from_X_data_specs()[0].validate(data)
+        X, Y = data
+        Y_hat = self.dropout_fprop(X)
+        return self.cost(Y, Y_hat)
+    
+    def dropout_cost_from_X_data_specs(self):
+        """
+        Returns the data specs needed by cost_from_X.
+
+        This is useful if cost_from_X is used in a MethodCost.
+        """
+        space = CompositeSpace((self.get_input_space(),
+                                self.get_target_space()))
+        source = (self.get_input_source(), self.get_target_source())
+        return (space, source)
+    
     def cost_from_X(self, data):
         """
         Computes self.cost, but takes data=(X, Y) rather than Y_hat as an
@@ -1141,8 +1174,6 @@ class Softmax(Layer):
         the same element can be included more than once).
     non_redundant : bool
         If True, learns only n_classes - 1 biases and weight vectors
-    kwargs : dict
-        Passed on to the superclass.
     """
 
     def __init__(self, n_classes, layer_name, irange=None,
@@ -1151,11 +1182,9 @@ class Softmax(Layer):
                  b_lr_scale=None, max_row_norm=None,
                  no_affine=False,
                  max_col_norm=None, init_bias_target_marginals=None,
-                 binary_target_dim=None, non_redundant=False,
-                 **kwargs):
+                 binary_target_dim=None, non_redundant=False):
 
-        super(Softmax, self).__init__(**kwargs)
-
+        super(Softmax, self).__init__()
         if max_col_norm is not None:
             self.extensions.append(MaxL2FilterNorm(max_col_norm, axis=0))
 
@@ -1309,6 +1338,7 @@ class Softmax(Layer):
         if not self.needs_reformat:
             assert self.desired_space == self.input_space
 
+
         rng = self.mlp.rng
 
         if self.no_affine:
@@ -1380,7 +1410,6 @@ class Softmax(Layer):
 
     @wraps(Layer.fprop)
     def fprop(self, state_below):
-
         self.input_space.validate(state_below)
 
         if self.needs_reformat:
@@ -1897,8 +1926,6 @@ class Linear(Layer):
         median of the data.
     use_bias : bool, optional
         If False, does not add the bias term to the output.
-    kwargs : dict
-        Passed on to superclass constructor.
     """
 
     def __init__(self,
@@ -1918,15 +1945,14 @@ class Linear(Layer):
                  min_col_norm=None,
                  copy_input=None,
                  use_abs_loss=False,
-                 use_bias=True,
-                 **kwargs):
+                 use_bias=True):
 
         if copy_input is not None:
             raise AssertionError(
                 "The copy_input option had a bug and has "
                 "been removed from the library.")
 
-        super(Linear, self).__init__(**kwargs)
+        super(Linear, self).__init__()
 
         if use_bias and init_bias is None:
             init_bias = 0.
@@ -2680,27 +2706,6 @@ class ConvNonlinearity(object):
 
         return rval
 
-    def cost(self, Y, Y_hat, batch_axis):
-        """
-        The cost of outputting Y_hat when the true output is Y.
-
-        Parameters
-        ----------
-        Y : theano.gof.Variable
-            Output of `fprop`
-        Y_hat : theano.gof.Variable
-            Targets
-        batch_axis : integer
-            axis representing batch dimension
-
-        Returns
-        -------
-        cost : theano.gof.Variable
-            0-D tensor describing the cost
-        """
-        raise NotImplementedError(
-            str(type(self)) + " does not implement cost function.")
-
 
 class IdentityConvNonlinearity(ConvNonlinearity):
 
@@ -2728,15 +2733,6 @@ class IdentityConvNonlinearity(ConvNonlinearity):
             rval["misclass"] = T.cast(incorrect, config.floatX).mean()
 
         return rval
-
-    @wraps(ConvNonlinearity.cost, append=True)
-    def cost(self, Y, Y_hat, batch_axis):
-        """
-        Notes
-        -----
-        Mean squared error across examples in a batch
-        """
-        return T.sum(T.mean(T.sqr(Y-Y_hat), axis=batch_axis))
 
 
 class RectifierConvNonlinearity(ConvNonlinearity):
@@ -2850,19 +2846,6 @@ class SigmoidConvNonlinearity(ConvNonlinearity):
 
         return rval
 
-    @wraps(ConvNonlinearity.cost, append=True)
-    def cost(self, Y, Y_hat, batch_axis):
-        """
-        Notes
-        -----
-        Cost mean across units, mean across batch of KL divergence
-        KL(P || Q) where P is defined by Y and Q is defined by Y_hat
-        KL(P || Q) = p log p - p log q + (1-p) log (1-p) - (1-p) log (1-q)
-        """
-        ave_total = kl(Y=Y, Y_hat=Y_hat, batch_axis=batch_axis)
-        ave = ave_total.mean()
-        return ave
-
 
 class TanhConvNonlinearity(ConvNonlinearity):
 
@@ -2960,6 +2943,9 @@ class ConvElemwise(Layer):
             be normalized as well
     kernel_stride : 2-tuple of ints, optional
         The stride of the convolution kernel. Default is (1, 1).
+    
+    max_k_dim : int
+    max_k : int
     """
 
     def __init__(self,
@@ -2982,8 +2968,11 @@ class ConvElemwise(Layer):
                  detector_normalization=None,
                  output_normalization=None,
                  kernel_stride=(1, 1),
-                 monitor_style="classification"):
-
+                 monitor_style="classification",
+                 max_k_dim=None,
+                 max_k=None):
+        self.max_k_dim=max_k_dim
+        self.max_k=max_k
         if (irange is None) and (sparse_init is None):
             raise AssertionError("You should specify either irange or "
                                  "sparse_init when calling the constructor of "
@@ -3062,7 +3051,7 @@ class ConvElemwise(Layer):
             sharedX(self.detector_space.get_origin_batch(dummy_batch_size))
 
         if self.pool_type is not None:
-            assert self.pool_type in ['max', 'mean']
+            assert self.pool_type in ['max', 'mean', 'max_k','mean_max']
             if self.pool_type == 'max':
                 dummy_p = max_pool(bc01=dummy_detector,
                                    pool_shape=self.pool_shape,
@@ -3070,6 +3059,19 @@ class ConvElemwise(Layer):
                                    image_shape=self.detector_space.shape)
             elif self.pool_type == 'mean':
                 dummy_p = mean_pool(bc01=dummy_detector,
+                                    pool_shape=self.pool_shape,
+                                    pool_stride=self.pool_stride,
+                                    image_shape=self.detector_space.shape)
+            elif self.pool_type == 'max_k':
+                dummy_p = max_k_pool(bc01=dummy_detector,
+                                    max_k_dim=self.max_k_dim,
+                                    max_k=self.max_k,
+                                    image_shape=self.detector_space.shape)
+            elif self.pool_type == 'mean_max':
+                dummy_p = max_pool(bc01=dummy_detector,
+                                   pool_shape=self.pool_shape,
+                                   pool_stride=self.pool_stride,
+                                   image_shape=self.detector_space.shape) + mean_pool(bc01=dummy_detector,
                                     pool_shape=self.pool_shape,
                                     pool_stride=self.pool_stride,
                                     image_shape=self.detector_space.shape)
@@ -3272,20 +3274,27 @@ class ConvElemwise(Layer):
             if self.detector_normalization:
                 d = self.detector_normalization(d)
 
-            assert self.pool_type in ['max', 'mean'], ("pool_type should be"
+            assert self.pool_type in ['max', 'mean','max_k','mean_max'], ("pool_type should be"
                                                        "either max or mean"
                                                        "pooling.")
-
             if self.pool_type == 'max':
                 p = max_pool(bc01=d, pool_shape=self.pool_shape,
                              pool_stride=self.pool_stride,
                              image_shape=self.detector_space.shape)
-
             elif self.pool_type == 'mean':
                 p = mean_pool(bc01=d, pool_shape=self.pool_shape,
                               pool_stride=self.pool_stride,
                               image_shape=self.detector_space.shape)
-
+            elif self.pool_type == 'max_k':
+                p = max_k_pool(bc01=d, max_k_dim=self.max_k_dim, 
+                                max_k=self.max_k,
+                                image_shape=self.detector_space.shape)
+            elif self.pool_type == 'mean_max':
+                p = max_pool(bc01=d, pool_shape=self.pool_shape,
+                            pool_stride=self.pool_stride,
+                            image_shape=self.detector_space.shape)+ mean_pool(bc01=d, pool_shape=self.pool_shape,
+                            pool_stride=self.pool_stride,
+                            image_shape=self.detector_space.shape)
             self.output_space.validate(p)
         else:
             p = d
@@ -3298,18 +3307,40 @@ class ConvElemwise(Layer):
 
         return p
 
-    @wraps(Layer.cost, append=True)
     def cost(self, Y, Y_hat):
         """
+        Cost for convnets is hardcoded to be the cost for sigmoids.
+        TODO: move the cost into the non-linearity class.
+
+        Parameters
+        ----------
+        Y : theano.gof.Variable
+            Output of `fprop`
+        Y_hat : theano.gof.Variable
+            Targets
+
+        Returns
+        -------
+        cost : theano.gof.Variable
+            0-D tensor describing the cost
+
         Notes
         -----
-        The cost method calls `self.nonlin.cost`
+        Cost mean across units, mean across batch of KL divergence
+        KL(P || Q) where P is defined by Y and Q is defined by Y_hat
+        KL(P || Q) = p log p - p log q + (1-p) log (1-p) - (1-p) log (1-q)
         """
-
+        assert self.nonlin.non_lin_name == "sigmoid", ("ConvElemwise "
+                                                       "supports "
+                                                       "cost function "
+                                                       "for only "
+                                                       "sigmoid layer "
+                                                       "for now.")
         batch_axis = self.output_space.get_batch_axis()
-        return self.nonlin.cost(Y=Y, Y_hat=Y_hat, batch_axis=batch_axis)
-
-
+        ave_total = kl(Y=Y, Y_hat=Y_hat, batch_axis=batch_axis)
+        ave = ave_total.mean()
+        return ave
+            
 class ConvRectifiedLinear(ConvElemwise):
 
     """
@@ -3377,6 +3408,7 @@ class ConvRectifiedLinear(ConvElemwise):
 
     kernel_stride : tuple
         The stride of the convolution kernel. A two-tuple of ints.
+
     """
 
     def __init__(self,
@@ -3399,7 +3431,9 @@ class ConvRectifiedLinear(ConvElemwise):
                  detector_normalization=None,
                  output_normalization=None,
                  kernel_stride=(1, 1),
-                 monitor_style="classification"):
+                 monitor_style="classification",
+                 max_k_dim=None,
+                 max_k=None):
 
         nonlinearity = RectifierConvNonlinearity(left_slope)
 
@@ -3436,7 +3470,9 @@ class ConvRectifiedLinear(ConvElemwise):
                                                   detector_normalization=dn,
                                                   output_normalization=on,
                                                   kernel_stride=kernel_stride,
-                                                  monitor_style=monitor_style)
+                                                  monitor_style=monitor_style,
+                                                  max_k_dim=max_k_dim,
+                                                  max_k=max_k)
 
 
 def pool_dnn(bc01, pool_shape, pool_stride, mode='max'):
@@ -4792,3 +4828,599 @@ def get_lr_scalers_from_layers(owner):
     assert all([isinstance(val, float) for val in rval.values()])
 
     return rval
+
+
+
+########################################
+#   author: xia.hong
+#   email:  xia.hong@baifendian.com
+########################################
+import theano
+
+class Projection(Layer):
+    '''
+    Transform from IndexSpace to VectorSpace
+     
+    Params
+    ---------
+    layer_name:str
+
+    word_num:int
+
+    vec_len:int
+
+    borrow:t/F
+
+    word_vectors_path:str,default None
+    path of .npy which could be used to init word embeding.
+
+    irange:float
+    '''
+
+    def __init__(self, layer_name, 
+                    word_num, vec_len, 
+                    word_vectors_path=None,
+                    borrow=True, irange=None,
+                    **kwargs):
+        super(Projection, self).__init__(**kwargs)
+         
+        self.layer_name=layer_name
+        self.word_num=word_num
+        self.vec_len=vec_len
+        self.word_vectors_path=word_vectors_path
+        
+        if word_vectors_path!=None and os.path.exists(word_vectors_path):
+            self.W=sharedX(np.load(word_vectors_path),borrow=borrow)
+        else:
+            self.W=sharedX(np.zeros([word_num,vec_len]),borrow=borrow)
+        self.W.name='Projection'
+        self._params=[self.W]
+
+    def fprop(self,state_blow,return_all=True):
+        #当state_blow为一个int(scalar)的时候，返回一个npy(ndim=1)
+        #当state_blow为一个vector的时候，返回一个npy(ndim=2)
+        #当state_blow为一个matrix的时候，返回一个npy(ndim=3)
+        #即在原本的输入加一个维度，长度为self.vec_len,内容为self.W[],如下代码即可，检验过了，无论state_blow.ndim
+        return self.W[state_blow]
+        
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+        self.input_space=space
+    
+    @wraps(Layer.get_weight_decay)
+    def get_weight_decay(self, coeff):
+        return coeff * T.sqr(self.W).sum()
+    
+    @wraps(Layer.get_layer_monitoring_channels)
+    def get_layer_monitoring_channels(self, state_below=None,state=None, targets=None):
+        rval=OrderedDict()
+        W = self.W
+        assert W.ndim == 2
+        sq_W = T.sqr(W)
+        row_norms = T.sqrt(sq_W.sum(axis=1))
+        col_norms = T.sqrt(sq_W.sum(axis=0))
+        rval.update(OrderedDict([('row_norms_mean', row_norms.mean())]))
+        return rval
+    
+    @wraps(Layer.get_weights)
+    def get_word_vectors(self,id):
+        return self.W[id,:]
+
+    @wraps(Layer.set_weights)
+    def set_word_vectors(self,id,vec):
+        self.W[id]=vec
+
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+        return coeff * abs(self.W).sum()
+
+    
+        
+    '''
+    def apply_dropout(self, state, include_prob, scale, theano_rng,
+                            input_space, mask_value=0, per_example=True):
+    def __setstate__(self, state):
+
+
+    @wraps(Layer.get_lr_scalers)
+    def get_lr_scalers(self):
+
+    @wraps(Layer.get_weights_topo)
+    def get_weights_topo(self):
+
+    @wraps(Layer.get_weights)
+    def get_weights(self):
+
+    @wraps(Layer.set_weights)
+    def set_weights(self, weights):
+
+    @wraps(Layer.cost)
+    def cost(self, Y, Y_hat):
+
+    @wraps(Layer.cost_matrix)
+    def cost_matrix(self, Y, Y_hat):
+
+
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+
+    def dropout_fprop(self,state_blow)
+
+    def get_params()
+
+    def get_l1_weight_decay(coeff):
+
+    def apply_dropout():
+
+    def cost(Y,Y_hat):
+
+    '''
+
+class DenseProjection(Layer):
+    '''
+    Transform from IndexSpace to VectorSpace
+     
+    Params
+    ---------
+    layer_name:str
+
+    word_num:int
+
+    vec_len:int
+
+    borrow:t/F
+
+    word_vectors_path:str,default None
+    path of .npy which could be used to init word embeding.
+
+    irange:float
+    '''
+
+    def __init__(self, layer_name, 
+                    word_num, sen_len, vec_len,
+                    word_vectors_path=None,
+                    update=True, irange=None,
+                    nolength=True,rule=None,enable_rule=False,
+                    **kwargs):
+        super(DenseProjection, self).__init__()
+        self.layer_name=layer_name
+        self.word_num=word_num
+        self.sen_len=sen_len
+        self.vec_len=vec_len
+        self.word_vectors_path=word_vectors_path
+        self.nolength=nolength
+        self.irange=irange
+        self.rule=rule
+        self.enable_rule=enable_rule
+        self.update=update
+        self.output_space=Conv2DSpace(shape=[self.sen_len,self.vec_len],num_channels=1, axes=('b',0,1,'c'))
+        
+        if word_vectors_path!=None:
+            if not os.path.exists(word_vectors_path):
+                raise error()
+            else:
+                print 'OK'
+                self.W=theano.shared(np.float32(np.load(open(word_vectors_path,'r'))),allow_downcast=True)
+                self.W0=theano.shared(np.float32(np.load(open(word_vectors_path,'r'))),allow_downcast=True)
+        else:
+            #rng = self.mlp.rng
+            #self.W=rng.uniform(-self.irange,self.irange,(word_num, vec_len))
+            #并不能运行，其他的所有layer上面2行代码是在set_space中运行，是别的对象调用，在调用前先调用了setup_rng
+
+            self.W=theano.shared(np.float32(np.random.uniform(-irange,irange,(word_num,vec_len))),allow_downcast=True)
+        self.W.name='Projection_W'
+        if update==True or update=='half':
+            self._params=[self.W]
+        else:
+            self._params=[]
+
+    @wraps(Layer.fprop)
+    def fprop(self,state_blow,return_all=True):
+        #当state_blow为一个int(scalar)的时候，返回一个npy(ndim=1)
+        #当state_blow为一个vector的时候，返回一个npy(ndim=2)
+        #当state_blow为一个matrix的时候，返回一个npy(ndim=3)
+        #即在原本的输入加一个维度，长度为self.vec_len,内容为self.W[],如下代码即可，检验过了，无论state_blow.ndim
+        state_blow=T.cast(state_blow,'int64')
+        inputs=state_blow[:,1:]
+        lengths=state_blow[:,0]
+        s=theano.shared(np.zeros((self.sen_len),dtype=np.float32))
+        print 'get in fprop' 
+        def fn(x):
+            rval=T.set_subtensor(s[:x],1.0)
+            return rval
+        def fn2(x):
+            x=x[1:]
+            return self.rule(x)
+        
+        mask,_=theano.map(fn=fn,sequences=lengths)
+        if self.enable_rule:
+            multiply,_=theano.map(fn=fn2,sequences=state_blow)
+            print 'syntax enabled'
+            mask=mask*multiply
+        rval=self.W[inputs]
+        if self.update=='half':
+            rval=rval+self.W0[inputs]
+        mask=T.shape_padright(mask,rval.ndim-2)
+        rval=rval*mask
+        return T.cast(T.shape_padright(rval,1),'float32')
+        #if not nolength:
+ 
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+        self.input_space=space
+    
+    @wraps(Layer.get_weight_decay)
+    def get_weight_decay(self, coeff):
+        return coeff * T.sqr(self.W).sum()
+    
+    @wraps(Layer.get_layer_monitoring_channels)
+    def get_layer_monitoring_channels(self, state_below=None,state=None, targets=None):
+        rval=OrderedDict()
+        W = self.W
+        assert W.ndim == 2
+        sq_W = T.sqr(W)
+        row_norms = T.sqrt(sq_W.sum(axis=1))
+        col_norms = T.sqrt(sq_W.sum(axis=0))
+        rval.update(OrderedDict([('row_norms_mean', row_norms.mean())]))
+        rval.update(OrderedDict([('row_norms_min', row_norms.min())]))
+        rval.update(OrderedDict([('row_norms_max', row_norms.max())]))
+        return rval
+    
+    @wraps(Layer.get_weights)
+    def get_word_vectors(self,id):
+        return self.W[id,:]
+
+    @wraps(Layer.set_weights)
+    def set_word_vectors(self,id,vec):
+        self.W[id]=vec
+
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+        return coeff * abs(self.W).sum()
+
+    
+        
+    '''
+    def apply_dropout(self, state, include_prob, scale, theano_rng,
+                            input_space, mask_value=0, per_example=True):
+    def __setstate__(self, state):
+
+
+    @wraps(Layer.get_lr_scalers)
+    def get_lr_scalers(self):
+
+    @wraps(Layer.get_weights_topo)
+    def get_weights_topo(self):
+
+    @wraps(Layer.get_weights)
+    def get_weights(self):
+
+    @wraps(Layer.set_weights)
+    def set_weights(self, weights):
+
+    @wraps(Layer.cost)
+    def cost(self, Y, Y_hat):
+
+    @wraps(Layer.cost_matrix)
+    def cost_matrix(self, Y, Y_hat):
+
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+
+    def dropout_fprop(self,state_blow)
+
+    def get_params()
+
+    def get_l1_weight_decay(coeff):
+
+    def apply_dropout():
+
+    def cost(Y,Y_hat):
+    '''
+
+class Merge(Layer):
+
+    def __init__(self, layer_name):
+        super(Merge, self).__init__()
+        self.layer_name=layer_name
+        self.output_space=VectorSpace(2)
+        self._params=[]
+
+    @wraps(Layer.fprop)
+    def fprop(self,state_blow):
+        self.input_space.validate(state_blow)
+
+        if self.needs_reformat:
+            state_blow = self.input_space.format_as(state_blow,
+                                                     self.desired_space)
+        def e(x):#TODO: change to better
+            a=abs(x-0.5)
+            return T.cast(a>0.1,'float32')*(a<0.4)*1/0.3+ \
+                    T.cast(a>=0.4,'float32')*1+T.cast(a<=0.1,'float32')*0
+
+        
+        W=e(state_blow)
+        pos=(state_blow*W).sum(axis=1)/(W.sum(axis=1)+0.0001)
+        neg=1-pos
+        rval=T.cast(T.stack(pos,neg).dimshuffle(1,0),'float32')
+        return rval
+    
+    @wraps(Layer.cost)
+    def cost(self, Y, Y_hat):
+        rval=-Y*T.log(Y_hat+0.0001)
+        return T.cast(rval.sum(axis=1).mean(),'float32')
+   
+    @wraps(Layer.get_input_space)
+    def get_input_space(self):
+        return self.input_space
+
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+
+        self.input_space = space
+
+        if not isinstance(space, Space):
+            raise TypeError("Expected Space, got " +
+                            str(space) + " of type " + str(type(space)))
+
+        self.input_dim = space.get_total_dimension()
+        desired_dim = self.input_dim
+        self.needs_reformat = not isinstance(space, VectorSpace)
+
+        self.desired_space = VectorSpace(desired_dim)
+ 
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+        return 0
+    
+    @wraps(Layer.get_weight_decay)
+    def get_weight_decay(self, coeff):
+        return 0
+    
+    @wraps(Layer.get_layer_monitoring_channels)
+    def get_layer_monitoring_channels(self, state_below=None,
+                                      state=None, targets=None):
+
+        rval = OrderedDict()
+        rval.update(OrderedDict([('shape0',T.cast(state_below[0].shape[0],'float32')),
+                                ('shape1',T.cast(state_below[0].shape[1],'float32')),
+                                ('shape2',T.cast(state_below[0].shape[2],'float32')),
+                                ('shape3',T.cast(state_below[0].shape[3],'float32'))]))
+        if (state_below is not None) or (state is not None):
+            if state is None:
+                state = self.fprop(state_below)
+            rval['shape_out0']=T.cast(state.shape[0],'float32')
+            rval['shape_out1']=T.cast(state.shape[1],'float32')
+            mx = T.cast(state.max(axis=1),'float32')
+
+            rval.update(OrderedDict([('mean_max_class', mx.mean()),
+                                     ('max_max_class', mx.max()),
+                                     ('min_max_class', mx.min())]))
+
+            if (targets is not None):
+                y_hat = T.argmax(state, axis=1)
+                y = T.argmax(targets, axis=1)
+                misclass = T.neq(y, y_hat).mean()
+                misclass = T.cast(misclass, 'float32')
+                rval['misclass'] = misclass
+                rval['nll'] = self.cost(Y_hat=state, Y=targets)
+                s2=-targets*T.log(state+0.0001)
+                rval['state2_min']=s2.min()
+                rval['state2_max']=s2.max()
+                mm=s2.sum(axis=1)
+                rval['s2_sum_max']=mm.min()
+                mmm=mm.mean()
+                rval['mmm']=mmm
+                
+                
+
+            rval['state_below_min0']=state_below[0].min()
+            rval['state_below_min1']=state_below[1].min()
+            rval['state_below_min2']=state_below[2].min()
+            rval['state_below_min3']=state_below[3].min()
+            rval['state_below_max0']=state_below[0].max()
+            rval['state_below_max1']=state_below[1].max()
+            rval['state_below_max2']=state_below[2].max()
+            rval['state_below_max3']=state_below[3].max()
+            rval['state_min']=state.min()
+            rval['state_max']=state.max()
+
+        return rval
+
+class BestCut(Layer):
+
+    def __init__(self, layer_name, batch_num=100, sen_len=50):
+        super(BestCut, self).__init__()
+        self.layer_name=layer_name
+        self.batch_num=batch_num
+        self.sen_len=sen_len
+        self.output_space=VectorSpace(2)
+        self._params=[]
+        
+    @wraps(Layer.fprop)
+    def fprop(self, state_blow, return_all=True):
+        G0,G1,G2,G3=state_blow
+        batch_num=G0.shape[0]
+        TT=T.ones_like(G0[:,0,:,0].dimshuffle(1,0))
+        A=0.5*T.stack(TT,TT,TT,TT).dimshuffle(1,2,0)
+        A=T.set_subtensor(A[:,:,0],G0[:,0,:,0].dimshuffle(1,0))
+        A=T.set_subtensor(A[1:,:,1],G1[:,0,:,0].dimshuffle(1,0))
+        A=T.set_subtensor(A[2:,:,2],G2[:,0,:,0].dimshuffle(1,0))
+        A=T.set_subtensor(A[3:,:,3],G3[:,0,:,0].dimshuffle(1,0))
+        def e(x):#TODO: change to better
+            return 1+x*T.log2(x)+(1-x)*T.log2(1-x)
+        E=e(A)
+        AE=A*E
+        
+        ar=T.arange(0,batch_num)
+        print type(batch_num)
+        def fn(ae1,ae2,ae3,ae4,e1,e2,e3,e4,f1,f2,f3,f4,s1,s2,s3,s4,ar):
+            #print ae1.ndim.e1.ndim, f1.ndim, s1.ndim
+            ff=T.stack(e1+f1,e2+f2,e3+f3,e4+f4)
+            f0,idx=T.max_and_argmax(ff,axis=0)
+            s=T.stack(s1,s2,s3,s4)
+            ae=T.stack(ae1,ae2,ae3,ae4)
+            s0=s[idx,ar]+ae[idx,ar]
+            return f0,s0
+
+        F=T.zeros_like(A[0,:,:].dimshuffle(1,0))
+        S=T.zeros_like(A[0,:,:].dimshuffle(1,0))
+
+
+        results, updates = \
+            theano.scan(
+                fn=fn,
+                sequences=[AE[:,:,3],AE[:,:,2],AE[:,:,1],AE[:,:,0],E[:,:,3],E[:,:,2],E[:,:,1],E[:,:,0]],
+                outputs_info=[
+                    dict(initial=F,taps=[-4,-3,-2,-1]),
+                    dict(initial=S,taps=[-4,-3,-2,-1]),
+                ],
+                non_sequences=[ar]
+                )
+        f,s=results
+        f=f[-1]
+        s=s[-1]
+        pos=s/f
+        neg=1-pos
+        rval=T.cast(T.stack(pos,neg).dimshuffle(1,0),'float32')
+        return rval
+    
+    @wraps(Layer.cost)
+    def cost(self, Y, Y_hat):
+        rval=-Y*T.log(Y_hat)
+        return T.cast(rval.sum(axis=1).mean(),'float32')
+     
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+        self.input_space=space
+        print space
+    
+
+    @wraps(Layer.get_l1_weight_decay)
+    def get_l1_weight_decay(self, coeff):
+        return 0
+    
+    @wraps(Layer.get_weight_decay)
+    def get_weight_decay(self, coeff):
+        return 0
+    
+    @wraps(Layer.get_layer_monitoring_channels)
+    def get_layer_monitoring_channels(self, state_below=None,
+                                      state=None, targets=None):
+
+        rval = OrderedDict()
+
+        if (state_below is not None) or (state is not None):
+            if state is None:
+                state = self.fprop(state_below)
+
+            mx = T.cast(state.max(axis=1),'float32')
+
+            rval.update(OrderedDict([('mean_max_class', mx.mean()),
+                                     ('max_max_class', mx.max()),
+                                     ('min_max_class', mx.min())]))
+
+            if (targets is not None):
+                y_hat = T.argmax(state, axis=1)
+                y = T.argmax(targets, axis=1)
+                misclass = T.neq(y, y_hat).mean()
+                misclass = T.cast(misclass, 'float32')
+                rval['misclass'] = misclass
+                rval['nll'] = self.cost(Y_hat=state, Y=targets)
+
+        return rval
+
+
+def max_k_pool(bc01, image_shape, max_k_dim, max_k):
+    '''
+    Max_k_pooling, assues pool_shape=[image_shape[0],1] or [1,image_shape[1]]
+    Parameters
+    ----------
+    theano tensor
+        minibatch in format (batch size, channels, rows, cols)
+    image_shape : tuple
+        avoid doing some of the arithmetic in theano
+    max_k_dim: int
+        k to select
+    max_K: int
+
+    Returns
+    ----------
+    pooled : theano tensor
+        The output of pooling applied to bc01
+    '''
+    def Max(x, n, k):
+        sorted_x_arg=T.argsort(x,axis=n)
+        if n==2:
+            dim0=T.repeat(T.arange(x.shape[0]),x.shape[1]*k*x.shape[3])
+            dim1=T.repeat(T.arange(x.shape[1]),x.shape[0]*k*x.shape[3])
+            dim3=T.repeat(T.arange(x.shape[3]),x.shape[0]*k*x.shape[1])
+            sorted_x_arg=T.sort(sorted_x_arg[:,:,-k:,:],axis=n)
+            return T.reshape(x[dim0,dim1,sorted_x_arg.flatten(),dim3],[x.shape[0],x.shape[1],k,x.shape[3]])
+        elif n==3:
+            dim0=T.repeat(T.arange(x.shape[0]),x.shape[1]*k*x.shape[2])
+            dim1=T.repeat(T.arange(x.shape[1]),x.shape[0]*k*x.shape[2])
+            dim2=T.repeat(T.arange(x.shape[2]),x.shape[0]*k*x.shape[1])
+            sorted_x_arg=T.sort(sorted_x_arg[:,:,:,-k:],axis=n)
+            return T.reshape(x[dim0,dim1,dim2,sorted_x_arg.flatten()],[x.shape[0],x.shape[1],x.shape[2],k])
+        
+    assert max_k_dim<=image_shape[max_k_dim]
+    if max_k_dim==0:
+        mxk=Max(bc01,2,max_k)
+    elif max_k_dim==1:
+        mxk=Max(bc01,3,max_k)
+    name=bc01.name
+    if name==None:
+        name='anon_bc01'
+    mxk.name='max_pool(' + name + ')'
+    return mxk
+
+class SequenceLayer(Layer):
+
+    def __init__(self,elem_layer=None, layer=None, output_space=None, layer_name=None, **kwargs):
+        super(SequenceLayer, self).__init__(**kwargs)
+        self.elem_layer=elem_layer
+        if elem_layer!=None:
+            self.internal_space=SequenceSpace(sub_space=elem_layer.get_output_space())
+        elif layer!=None:
+            self.internal_space=layer.get_out_pspace()
+        self.output_space=output_space
+        self.layer_name=layer_name
+
+    def fprop(self,state_blow):
+        '''
+        def f_seq(x):
+            return W[x[:self.sen_len]]
+
+        def f_conv(x):
+            y=W[x[:self.sen_len]]
+            z=sharedX(np.zeros((self.sen_len,self.vec_len),dtype=np.float32))
+            o=set_subtensor(z[:y.shape[0],:],y)
+            return o
+        
+        if self.out_space=='Conv2D':
+            fn=lambda x:f_conv(x)
+        else:
+            fn=lambda x:f_seq(x)
+        '''
+        if elem_layer!=None:
+            print 'Not implemented'
+        elif layer!=None:
+            rval,_=theano.map(
+                fn=lambda x:self.layer.fprop(x),
+                sequences=state_blow
+                )
+            rval=self.internal_space.format_as(rval,self.output_space)
+        return rval
+        
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+        self.input_space=space
+    
+    @wraps(Layer.get_weight_decay)
+    def get_weight_decay(self, coeff):
+        return self.layer.get_weight_decay(coeff)
+    
+    @wraps(Layer.get_layer_monitoring_channels)
+    def get_layer_monitoring_channels(self, state_below=None,state=None, targets=None):
+        return {}
